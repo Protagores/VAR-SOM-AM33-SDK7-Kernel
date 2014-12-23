@@ -13,6 +13,15 @@ Required Properties:
     by the GPIO flags.
 - hw_margin_ms: Maximum time to reset watchdog circuit (milliseconds).
 
+Optional Properties:
+- period_ms: Period of resetting watchdog circuit (milliseconds). If
+  specified, it is used instead of default (hw_margin_ms / 2). Later
+  it can be read and/or changed from userspace via period_ms platform
+  device attribute in sysfs. The value should always be positive and
+  less than hw_margin_ms. This can be useful if the same pin is wired
+  to a watchdog circuit and, simultaneously, to e. g. a status LED,
+  blinking frequency of which has some special meaning, for example.
+
 Example:
 	watchdog: watchdog {
 		/* ADM706 */
@@ -20,4 +29,5 @@ Example:
 		gpios = <&gpio3 9 GPIO_ACTIVE_LOW>;
 		hw_algo = "toggle";
 		hw_margin_ms = <1600>;
+		period_ms = <1000>;
 	};

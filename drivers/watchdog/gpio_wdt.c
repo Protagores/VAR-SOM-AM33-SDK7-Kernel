@@ -32,10 +32,11 @@ struct gpio_wdt_priv {
 	bool			active_low;
 	bool			state;
 	unsigned int		hw_algo;
-	unsigned int		hw_margin;
+	unsigned int		hw_margin_ms;
+	unsigned long		period;
 	unsigned long		last_jiffies;
 	struct notifier_block	notifier;
-	struct timer_list	timer;
+	struct delayed_work	work;
 	struct watchdog_device	wdd;
 };
 
@@ -55,7 +56,7 @@ static int gpio_wdt_start(struct watchdog_device *wdd)
 	priv->state = priv->active_low;
 	gpio_direction_output(priv->gpio, priv->state);
 	priv->last_jiffies = jiffies;
-	mod_timer(&priv->timer, priv->last_jiffies + priv->hw_margin);
+	schedule_delayed_work(&priv->work, priv->period);
 
 	return 0;
 }
@@ -64,7 +65,7 @@ static int gpio_wdt_stop(struct watchdog_device *wdd)
 {
 	struct gpio_wdt_priv *priv = watchdog_get_drvdata(wdd);
 
-	mod_timer(&priv->timer, 0);
+	cancel_delayed_work_sync(&priv->work);
 	gpio_wdt_disable(priv);
 
 	return 0;
@@ -86,19 +87,19 @@ static int gpio_wdt_set_timeout(struct watchdog_device *wdd, unsigned int t)
 	return gpio_wdt_ping(wdd);
 }
 
-static void gpio_wdt_hwping(unsigned long data)
+static void gpio_wdt_hwping(struct work_struct *w)
 {
-	struct watchdog_device *wdd = (struct watchdog_device *)data;
-	struct gpio_wdt_priv *priv = watchdog_get_drvdata(wdd);
+	struct gpio_wdt_priv *priv =
+		container_of((struct delayed_work *)w, struct gpio_wdt_priv, work);
 
 	if (time_after(jiffies, priv->last_jiffies +
-		       msecs_to_jiffies(wdd->timeout * 1000))) {
-		dev_crit(wdd->dev, "Timer expired. System will reboot soon!\n");
+		       msecs_to_jiffies(priv->wdd.timeout * 1000))) {
+		dev_crit(priv->wdd.dev, "Timeout expired. System will reboot soon!\n");
 		return;
 	}
 
-	/* Restart timer */
-	mod_timer(&priv->timer, jiffies + priv->hw_margin);
+	/* Restart delayed work */
+	schedule_delayed_work(&priv->work, priv->period);
 
 	switch (priv->hw_algo) {
 	case HW_ALGO_TOGGLE:
@@ -121,7 +122,7 @@ static int gpio_wdt_notify_sys(struct notifier_block *nb, unsigned long code,
 	struct gpio_wdt_priv *priv = container_of(nb, struct gpio_wdt_priv,
 						  notifier);
 
-	mod_timer(&priv->timer, 0);
+	cancel_delayed_work_sync(&priv->work);
 
 	switch (code) {
 	case SYS_HALT:
@@ -149,11 +150,39 @@ static const struct watchdog_ops gpio_wdt_ops = {
 	.set_timeout	= gpio_wdt_set_timeout,
 };
 
+static ssize_t gpio_wdt_show_period_ms(struct device *dev,
+	struct device_attribute *attr, char *buf)
+{
+	struct gpio_wdt_priv *priv = dev_get_drvdata(dev);
+
+	return snprintf(buf, PAGE_SIZE, "%u\n", jiffies_to_msecs(priv->period));
+}
+
+static ssize_t gpio_wdt_store_period_ms(struct device *dev,
+	struct device_attribute *attr, const char *buf, size_t count)
+{
+	struct gpio_wdt_priv *priv = dev_get_drvdata(dev);
+	char *end;
+
+	unsigned long period_ms = simple_strtoul(buf, &end, 0);
+	if (end == buf) {
+		return -EINVAL;
+	} else if (period_ms > 0 && period_ms < priv->hw_margin_ms) {
+		priv->period = msecs_to_jiffies(period_ms);
+		return count;
+	} else {
+		return -EINVAL;
+	}
+}
+
+static DEVICE_ATTR(period_ms, (S_IRUGO | S_IWUSR),
+	gpio_wdt_show_period_ms, gpio_wdt_store_period_ms);
+
 static int gpio_wdt_probe(struct platform_device *pdev)
 {
 	struct gpio_wdt_priv *priv;
 	enum of_gpio_flags flags;
-	unsigned int hw_margin;
+	unsigned int period_ms;
 	unsigned long f = 0;
 	const char *algo;
 	int ret;
@@ -187,17 +216,26 @@ static int gpio_wdt_probe(struct platform_device *pdev)
 		return ret;
 
 	ret = of_property_read_u32(pdev->dev.of_node,
-				   "hw_margin_ms", &hw_margin);
+				   "hw_margin_ms", &priv->hw_margin_ms);
 	if (ret)
 		return ret;
 	/* Disallow values lower than 2 and higher than 65535 ms */
-	if (hw_margin < 2 || hw_margin > 65535)
+	if (priv->hw_margin_ms < 2 || priv->hw_margin_ms > 65535)
 		return -EINVAL;
 
-	/* Use safe value (1/2 of real timeout) */
-	priv->hw_margin = msecs_to_jiffies(hw_margin / 2);
+	ret = of_property_read_u32(pdev->dev.of_node, "period_ms", &period_ms);
+	if (ret) {
+		/* Use safe value (1/2 of real timeout) by default */
+		priv->period = msecs_to_jiffies(priv->hw_margin_ms / 2);
+		period_ms = 0;
+	} else if (period_ms > 0 && period_ms < priv->hw_margin_ms) {
+		priv->period = msecs_to_jiffies(period_ms);
+	} else {
+		return -EINVAL;
+	}
 
 	watchdog_set_drvdata(&priv->wdd, priv);
+	platform_set_drvdata(pdev, priv);
 
 	priv->wdd.info		= &gpio_wdt_ident;
 	priv->wdd.ops		= &gpio_wdt_ops;
@@ -207,16 +245,21 @@ static int gpio_wdt_probe(struct platform_device *pdev)
 	if (watchdog_init_timeout(&priv->wdd, 0, &pdev->dev) < 0)
 		priv->wdd.timeout = SOFT_TIMEOUT_DEF;
 
-	setup_timer(&priv->timer, gpio_wdt_hwping, (unsigned long)&priv->wdd);
+	INIT_DELAYED_WORK(&priv->work, gpio_wdt_hwping);
 
 	ret = watchdog_register_device(&priv->wdd);
 	if (ret)
 		return ret;
 
+	if (period_ms)
+		device_create_file(&pdev->dev, &dev_attr_period_ms);
+
 	priv->notifier.notifier_call = gpio_wdt_notify_sys;
 	ret = register_reboot_notifier(&priv->notifier);
-	if (ret)
+	if (ret) {
+		device_remove_file(&pdev->dev, &dev_attr_period_ms);
 		watchdog_unregister_device(&priv->wdd);
+	}
 
 	return ret;
 }
@@ -225,8 +268,9 @@ static int gpio_wdt_remove(struct platform_device *pdev)
 {
 	struct gpio_wdt_priv *priv = platform_get_drvdata(pdev);
 
-	del_timer_sync(&priv->timer);
+	cancel_delayed_work_sync(&priv->work);
 	unregister_reboot_notifier(&priv->notifier);
+	device_remove_file(&pdev->dev, &dev_attr_period_ms);
 	watchdog_unregister_device(&priv->wdd);
 
 	return 0;
