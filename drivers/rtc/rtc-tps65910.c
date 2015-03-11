@@ -222,6 +222,89 @@ static const struct rtc_class_ops tps65910_rtc_ops = {
 	.alarm_irq_enable = tps65910_rtc_alarm_irq_enable,
 };
 
+static ssize_t tps65910_rtc_show_comp(struct device *dev,
+	struct device_attribute *attr, char *buf)
+{
+	struct tps65910 *tps = dev_get_drvdata(dev->parent);
+	int ret, comp;
+	u32 rtc_reg;
+	u8 lsb, msb;
+
+	ret = regmap_read(tps->regmap, TPS65910_RTC_COMP_LSB, &rtc_reg);
+	if (ret)
+		return ret;
+	lsb = rtc_reg & 0xff;
+
+	ret = regmap_read(tps->regmap, TPS65910_RTC_COMP_MSB, &rtc_reg);
+	if (ret)
+		return ret;
+	msb = rtc_reg & 0xff;
+
+	comp = (msb & 0x80 ? msb - 0x100 : msb) * 0x100 + lsb;
+	return snprintf(buf, PAGE_SIZE, "%d\n", comp);
+}
+
+static ssize_t tps65910_rtc_store_comp(struct device *dev,
+	struct device_attribute *attr, const char *buf, size_t count)
+{
+	struct tps65910 *tps = dev_get_drvdata(dev->parent);
+	int ret;
+	char *end;
+
+	long comp = simple_strtol(buf, &end, 0);
+	if (end == buf || comp >= 0x7fffl || comp < -0x8000l)
+		return -EINVAL;
+	else if (comp < 0)
+		comp += 0x10000l;
+
+	ret = regmap_write(tps->regmap, TPS65910_RTC_COMP_LSB, comp & 0xff);
+	if (ret)
+		return ret;
+
+	ret = regmap_write(tps->regmap, TPS65910_RTC_COMP_MSB, comp >> 8);
+	if (ret)
+		return ret;
+
+	return count;
+}
+
+static DEVICE_ATTR(comp, (S_IRUGO | S_IWUSR),
+	tps65910_rtc_show_comp, tps65910_rtc_store_comp);
+
+static ssize_t tps65910_rtc_show_auto_comp(struct device *dev,
+	struct device_attribute *attr, char *buf)
+{
+	struct tps65910 *tps = dev_get_drvdata(dev->parent);
+	int ret;
+	u32 rtc_reg;
+
+	ret = regmap_read(tps->regmap, TPS65910_RTC_CTRL, &rtc_reg);
+	if (ret)
+		return ret;
+
+	return snprintf(buf, PAGE_SIZE, "%d\n",
+		(rtc_reg & TPS65910_RTC_CTRL_AUTO_COMP) != 0);
+}
+
+static ssize_t tps65910_rtc_store_auto_comp(struct device *dev,
+	struct device_attribute *attr, const char *buf, size_t count)
+{
+	struct tps65910 *tps = dev_get_drvdata(dev->parent);
+	int ret;
+	bool auto_comp;
+
+	if (strtobool(buf, &auto_comp) < 0)
+		return -EINVAL;
+
+	ret = regmap_update_bits(tps->regmap, TPS65910_RTC_CTRL,
+		TPS65910_RTC_CTRL_AUTO_COMP,
+		auto_comp ? TPS65910_RTC_CTRL_AUTO_COMP : 0);
+	return ret ? ret : count;
+}
+
+static DEVICE_ATTR(auto_comp, (S_IRUGO | S_IWUSR),
+	tps65910_rtc_show_auto_comp, tps65910_rtc_store_auto_comp);
+
 static int tps65910_rtc_probe(struct platform_device *pdev)
 {
 	struct tps65910 *tps65910 = NULL;
@@ -287,16 +370,22 @@ static int tps65910_rtc_probe(struct platform_device *pdev)
 
 	platform_set_drvdata(pdev, tps_rtc);
 
+	device_create_file(&pdev->dev, &dev_attr_comp);
+	device_create_file(&pdev->dev, &dev_attr_auto_comp);
+
 	return 0;
 }
 
 /*
  * Disable tps65910 RTC interrupts.
  * Sets status flag to free.
+ * Removes control files from sysfs.
  */
 static int tps65910_rtc_remove(struct platform_device *pdev)
 {
 	tps65910_rtc_alarm_irq_enable(&pdev->dev, 0);
+	device_remove_file(&pdev->dev, &dev_attr_comp);
+	device_remove_file(&pdev->dev, &dev_attr_auto_comp);
 
 	return 0;
 }
